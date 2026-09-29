@@ -10,21 +10,25 @@
     left: 0; right: 0; bottom: 0;
     box-sizing: border-box;
     width: 100%;
-    height: 48px;
+    min-height: 40px;
+    max-height: 40%;
     padding: 8px 12px;
     background: rgba(20, 20, 30, 0.9);
     color: #eee;
     border: none;
     border-top: 1px solid #334;
-    font: 16px sans-serif;
+    font: 16px monospace;
+    line-height: 1.4;
     outline: none;
     resize: none;
+    overflow-y: auto;
     z-index: 10;
   }
+  #textbox.invalid { box-shadow: inset 0 2px 0 0 #ff4444; }
 </style>
 </head>
 <body>
-<textarea id="textbox" placeholder="Ask a question about the qubit…"></textarea>
+<textarea id="textbox" rows="1" placeholder="e.g. |0>,  1/sqrt(2) |0> + 1/sqrt(2) |1>,  sqrt(3)/2 |0> + 1/2 |1>,  |+>,  e^(i pi/4) |1>  (separate multiple qubits with commas)"></textarea>
 <script type="importmap">
 {
   "imports": {
@@ -47,45 +51,212 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(devicePixelRatio);
 document.body.appendChild(renderer.domElement);
 
-// Bloch sphere (translucent)
-const sphere = new THREE.Mesh(
-  new THREE.SphereGeometry(1, 48, 48),
-  new THREE.MeshPhongMaterial({
-    color: 0x2255aa,
-    transparent: true,
-    opacity: 0.15,
-    side: THREE.DoubleSide,
-    depthWrite: false
-  })
+/* ================= math: complex numbers & ket expressions ================= */
+
+const C = (re, im = 0) => ({ re, im });
+const cadd = (u, v) => C(u.re + v.re, u.im + v.im);
+const csub = (u, v) => C(u.re - v.re, u.im - v.im);
+const cmul = (u, v) => C(u.re * v.re - u.im * v.im, u.re * v.im + u.im * v.re);
+const cdiv = (u, v) => {
+  const d = v.re * v.re + v.im * v.im;
+  if (d === 0) throw new Error('division by zero');
+  return C((u.re * v.re + u.im * v.im) / d, (u.im * v.re - u.re * v.im) / d);
+};
+const cabs = u => Math.hypot(u.re, u.im);
+const cscale = (u, s) => C(u.re * s, u.im * s);
+
+// u^v for complex u, v (polar form); handles real, imaginary and general exponents
+function cpow(u, v) {
+  if (u.re === 0 && u.im === 0) {
+    if (v.re === 0 && v.im === 0) return C(1);
+    throw new Error('0^0 or 0^i undefined');
+  }
+  const r = cabs(u), phi = Math.atan2(u.im, u.re);
+  // (r e^{i phi})^(c+id) = r^c e^{-d phi} * e^{i (c phi + d ln r)}
+  const mag = Math.pow(r, v.re) * Math.exp(-v.im * phi);
+  const ang = v.re * phi + v.im * Math.log(r);
+  return C(mag * Math.cos(ang), mag * Math.sin(ang));
+}
+
+// a ket value is a state vector {|0> amplitude, |1> amplitude}
+const KETS = {
+  '|0>':  { a: C(1), b: C(0) },
+  '|1>':  { a: C(0), b: C(1) },
+  '|+>':  { a: C(Math.SQRT1_2), b: C(Math.SQRT1_2) },
+  '|->':  { a: C(Math.SQRT1_2), b: C(-Math.SQRT1_2) },
+  '|i>':  { a: C(Math.SQRT1_2), b: C(0, Math.SQRT1_2) },
+  '|-i>': { a: C(Math.SQRT1_2), b: C(0, -Math.SQRT1_2) }
+};
+
+// state arithmetic: numbers behave as scalars (b = 0), kets as vectors
+function smul(u, v) {
+  if (isScalar(u)) return { a: cmul(u, v.a), b: cmul(u, v.b) };
+  if (isScalar(v)) return { a: cmul(u.a, v), b: cmul(u.b, v) };
+  throw new Error('cannot multiply two states');
+}
+function sdiv(u, v) {
+  if (isScalar(v)) return { a: cdiv(u.a, v), b: cdiv(u.b, v) };
+  throw new Error('cannot divide by a state');
+}
+const isScalar = s => s.b.re === 0 && s.b.im === 0;
+const sadd = (u, v) => ({ a: cadd(u.a, v.a), b: cadd(u.b, v.b) });
+const ssub = (u, v) => ({ a: csub(u.a, v.a), b: csub(u.b, v.b) });
+
+/* tokenizer: kets are atomic; implicit multiplication supported */
+function tokenize(src) {
+  src = src.replace(/−/g, '-').replace(/⟩/g, '>').replace(/√/g, 'sqrt');
+  const tokens = [];
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (ch === '|') {
+      const rest = src.slice(i);
+      const m = rest.match(/^\|(0|1|\+|-i|-|i)>/);
+      if (!m) throw new Error(`unrecognized ket at "${rest.slice(0, 6)}"`);
+      tokens.push({ t: 'ket', v: m[0] });
+      i += m[0].length;
+      continue;
+    }
+    if (/[0-9.]/.test(ch)) {
+      const m = src.slice(i).match(/^[0-9]*\.?[0-9]+/);
+      tokens.push({ t: 'num', v: parseFloat(m[0]) });
+      i += m[0].length;
+      continue;
+    }
+    if (/[a-z]/i.test(ch)) {
+      const m = src.slice(i).match(/^[a-z]+/i)[0];
+      if (m === 'i') tokens.push({ t: 'i' });
+      else if (m === 'pi') tokens.push({ t: 'pi' });
+      else if (m === 'e') tokens.push({ t: 'e' });
+      else if (m === 'sqrt' || m === 'exp') tokens.push({ t: 'fn', v: m });
+      else throw new Error(`unknown symbol "${m}"`);
+      i += m.length;
+      continue;
+    }
+    if ('+-*/^()'.includes(ch)) { tokens.push({ t: ch }); i++; continue; }
+    throw new Error(`unexpected character "${ch}"`);
+  }
+  return tokens;
+}
+
+/* recursive-descent parser producing states/scalars */
+function parseExpr(tokens) {
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++];
+  const expect = t => {
+    if (!peek() || peek().t !== t) throw new Error(`expected "${t}"`);
+    return next();
+  };
+
+  function expr() {
+    let v = term();
+    while (peek() && (peek().t === '+' || peek().t === '-'))
+      v = (next().t === '+') ? sadd(v, term()) : ssub(v, term());
+    return v;
+  }
+  function term() {
+    let v = unary();
+    for (;;) {
+      const p = peek();
+      if (p && p.t === '*') { next(); v = smul(v, unary()); }
+      else if (p && p.t === '/') { next(); v = sdiv(v, unary()); }
+      else if (p && (p.t === 'num' || p.t === 'i' || p.t === 'pi' || p.t === 'e' || p.t === 'fn' || p.t === 'ket' || p.t === '('))
+        v = smul(v, unary());          // implicit multiplication (Desmos-style)
+      else break;
+    }
+    return v;
+  }
+  function unary() {
+    if (peek() && peek().t === '-') { next(); return neg(unary()); }
+    if (peek() && peek().t === '+') { next(); return unary(); }
+    return power();
+  }
+  function neg(s) { return { a: cscale(s.a, -1), b: cscale(s.b, -1) }; }
+  function power() {
+    let v = atom();
+    if (peek() && peek().t === '^') { next(); v = spow(v, unary()); }
+    return v;
+  }
+  function spow(u, v) {
+    if (isScalar(u) && isScalar(v)) return { a: cpow(u.a, v.a), b: C(0) };
+    if (isScalar(v)) return { a: cpow(u.a, v.a), b: cpow(u.b, v.a) };
+    throw new Error('cannot raise a state to a state power');
+  }
+  function atom() {
+    const p = next();
+    if (!p) throw new Error('unexpected end of expression');
+    if (p.t === 'num') return { a: C(p.v), b: C(0) };
+    if (p.t === 'i') return { a: C(0, 1), b: C(0) };
+    if (p.t === 'pi') return { a: C(Math.PI), b: C(0) };
+    if (p.t === 'e') return { a: C(Math.E), b: C(0) };
+    if (p.t === 'ket') return KETS[p.v];
+    if (p.t === '(') { const v = expr(); expect(')'); return v; }
+    if (p.t === 'fn') {
+      if (p.v === 'sqrt') {
+        expect('(');
+        const v = expr();
+        expect(')');
+        if (!isScalar(v)) throw new Error('sqrt of a state');
+        if (v.a.re < 0 || v.a.im !== 0) throw new Error('sqrt of negative');
+        return { a: C(Math.sqrt(v.a.re)), b: C(0) };
+      }
+      if (p.v === 'exp') {
+        expect('(');
+        const v = expr();
+        expect(')');
+        if (!isScalar(v)) throw new Error('exp of a state');
+        return { a: cpow(C(Math.E), v.a), b: C(0) };
+      }
+    }
+    throw new Error(`unexpected token "${p.t}"`);
+  }
+
+  const v = expr();
+  if (pos < tokens.length) throw new Error(`unexpected "${tokens[pos].v ?? tokens[pos].t}"`);
+  return v;
+}
+
+/* parse one comma-separated qubit expression -> normalized {a, b} or null */
+function parseQubit(src) {
+  const s = parseExpr(tokenize(src));
+  const mag = Math.hypot(cabs(s.a), cabs(s.b));
+  if (mag < 1e-12) throw new Error('zero state');
+  return { a: cscale(s.a, 1 / mag), b: cscale(s.b, 1 / mag) };
+}
+
+// Bloch vector of a|0> + b|1>  (r_x = 2 Re(a* b), r_y = 2 Im(a* b), r_z = |a|^2 - |b|^2)
+function blochVector(state) {
+  const ab = cmul(C(state.a.re, -state.a.im), state.b);
+  return new THREE.Vector3(
+    2 * ab.re,            // Bloch x
+    state.a.re ** 2 + state.a.im ** 2 - state.b.re ** 2 - state.b.im ** 2,  // Bloch z
+    2 * ab.im             // Bloch y
+  );
+}
+
+/* ================= scene: reusable Bloch sphere assemblies ================= */
+
+const sphereGeo = new THREE.SphereGeometry(1, 48, 48);
+const sphereMat = new THREE.MeshPhongMaterial({
+  color: 0x2255aa, transparent: true, opacity: 0.15,
+  side: THREE.DoubleSide, depthWrite: false
+});
+const wireGeo = new THREE.EdgesGeometry(new THREE.SphereGeometry(1, 32, 24));
+const wireMat = new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.25 });
+const equatorGeo = new THREE.BufferGeometry().setFromPoints(
+  new THREE.EllipseCurve(0, 0, 1, 1, 0, Math.PI * 2).getPoints(128).map(p => new THREE.Vector3(p.x, 0, -p.y))
 );
-scene.add(sphere);
+const equatorMat = new THREE.LineBasicMaterial({ color: 0xffaa00 });
+const arrowHead = { headLength: 0.08, headWidth: 0.04 };
+const labelMats = {
+  '|0>': makeLabelMat('|0\u27E9', '#ff6666'),  '|1>': makeLabelMat('|1\u27E9', '#ff6666'),
+  '|+>': makeLabelMat('|+\u27E9', '#66ff66'),  '|->': makeLabelMat('|\u2212\u27E9', '#66ff66'),
+  '|i>': makeLabelMat('|i\u27E9', '#66aaff'),  '|-i>': makeLabelMat('|\u2212i\u27E9', '#66aaff')
+};
 
-// Wireframe outline
-const wire = new THREE.LineSegments(
-  new THREE.EdgesGeometry(new THREE.SphereGeometry(1, 32, 24)),
-  new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.25 })
-);
-scene.add(wire);
-
-// Equator
-const equator = new THREE.Line(
-  new THREE.BufferGeometry().setFromPoints(
-    new THREE.EllipseCurve(0, 0, 1, 1, 0, Math.PI * 2).getPoints(128).map(p => new THREE.Vector3(p.x, 0, -p.y))
-  ),
-  new THREE.LineBasicMaterial({ color: 0xffaa00 })
-);
-scene.add(equator);
-
-// Bloch axes: |0>/|1> along vertical (three.js Y), |+>/|-> along X, |i>/|-i> along Z
-const xAxis = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, 0.08, 0.04);  // |+>
-const xNegAxis = new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, 0.08, 0.04);  // |->
-const yAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 1.25, 0xff4444, 0.08, 0.04);  // |0> (north pole)
-const yNegAxis = new THREE.ArrowHelper(new THREE.Vector3(0, -1, 0), new THREE.Vector3(), 1.25, 0xff4444, 0.08, 0.04);  // |1> (south pole)
-const zAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 1.25, 0x4488ff, 0.08, 0.04);  // |i>
-const zNegAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 1.25, 0x4488ff, 0.08, 0.04);  // |-i>
-
-// Text labels as camera-facing sprites
-function makeLabel(text, color) {
+function makeLabelMat(text, color) {
   const scale = 4;
   const canvas = document.createElement('canvas');
   canvas.width = 128 * scale;
@@ -97,45 +268,127 @@ function makeLabel(text, color) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(text, 64, 34);
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: new THREE.CanvasTexture(canvas),
-    transparent: true,
-    depthTest: false
-  }));
-  sprite.scale.set(0.45, 0.225, 1);
-  return sprite;
+  return new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true, depthTest: false });
 }
-const labels = [
-  ['|0\u27E9', 0xff6666, new THREE.Vector3(0, 1.45, 0)],
-  ['|1\u27E9', 0xff6666, new THREE.Vector3(0, -1.45, 0)],
-  ['|+\u27E9', 0x66ff66, new THREE.Vector3(1.45, 0, 0)],
-  ['|\u2212\u27E9', 0x66ff66, new THREE.Vector3(-1.45, 0, 0)],
-  ['|i\u27E9', 0x66aaff, new THREE.Vector3(0, 0, 1.45)],
-  ['|\u2212i\u27E9', 0x66aaff, new THREE.Vector3(0, 0, -1.45)]
-].map(([text, color, pos]) => {
-  const s = makeLabel(text, '#' + color.toString(16).padStart(6, '0'));
-  s.position.copy(pos);
+
+function makeLabelSprite(key) {
+  const s = new THREE.Sprite(labelMats[key]);
+  s.scale.set(0.45, 0.225, 1);
   return s;
-});
+}
 
+function makeAssembly() {
+  const g = new THREE.Group();
+  g.add(
+    new THREE.Mesh(sphereGeo, sphereMat),
+    new THREE.LineSegments(wireGeo, wireMat),
+    new THREE.Line(equatorGeo, equatorMat),
+    new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, arrowHead.headLength, arrowHead.headWidth),
+    new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, arrowHead.headLength, arrowHead.headWidth),
+    new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 1.25, 0xff4444, arrowHead.headLength, arrowHead.headWidth),
+    new THREE.ArrowHelper(new THREE.Vector3(0, -1, 0), new THREE.Vector3(), 1.25, 0xff4444, arrowHead.headLength, arrowHead.headWidth),
+    new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 1.25, 0x4488ff, arrowHead.headLength, arrowHead.headWidth),
+    new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 1.25, 0x4488ff, arrowHead.headLength, arrowHead.headWidth)
+  );
+  // labels at the arrow tips
+  const tips = {
+    '|0>': [0, 1.45, 0],  '|1>': [0, -1.45, 0],
+    '|+>': [1.45, 0, 0],  '|->': [-1.45, 0, 0],
+    '|i>': [0, 0, 1.45],  '|-i>': [0, 0, -1.45]
+  };
+  for (const [k, p] of Object.entries(tips)) {
+    const s = makeLabelSprite(k);
+    s.position.set(...p);
+    g.add(s);
+  }
+  // state arrow (white), hidden until a valid state is entered
+  const stateArrow = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 1, 0xffffff, 0.12, 0.06);
+  stateArrow.visible = false;
+  g.add(stateArrow);
+  g.userData.stateArrow = stateArrow;
+  return g;
+}
 
-// Lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-const light = new THREE.DirectionalLight(0xffffff, 1);
-light.position.set(5, 5, 5);
-scene.add(light);
+/* rolling parent: all assemblies share one rotating frame */
+const root = new THREE.Group();
+scene.add(root);
 
-// Mouse "rolling": drag to rotate the whole scene group
-// Invariant: sphere, grid, equator, all six axis arrows, their labels,
-// and the state vector must share the same rotating parent.
-const group = new THREE.Group();
-group.add(
-  sphere, wire, equator,
-  xAxis, xNegAxis, yAxis, yNegAxis, zAxis, zNegAxis,
-  ...labels
-);
-scene.add(group);
+const assemblies = [];
 
+/* split input on top-level commas -> one expression per qubit */
+function splitQubits(src) {
+  const parts = [];
+  let depth = 0, cur = '';
+  for (const ch of src) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  parts.push(cur);
+  return parts.map(s => s.trim()).filter(s => s.length);
+}
+
+const textbox = document.getElementById('textbox');
+
+// auto-grow to fit content (placeholder and typed text), capped at 40% viewport
+// height is border-box, so add border widths to scrollHeight (which is content+padding)
+function autoSize() {
+  const borders = textbox.offsetHeight - textbox.clientHeight;
+  textbox.style.height = 'auto';
+  textbox.style.height = Math.min(textbox.scrollHeight + borders, 0.4 * innerHeight) + 'px';
+}
+textbox.addEventListener('input', () => { autoSize(); update(); });
+addEventListener('resize', autoSize);
+
+function update() {
+  const src = textbox.value.trim();
+  let states = [];
+  if (src) {
+    try {
+      states = splitQubits(src).map(parseQubit);
+      textbox.classList.remove('invalid');
+    } catch (e) {
+      textbox.classList.add('invalid');   // keep last valid render
+    }
+  } else {
+    textbox.classList.remove('invalid');
+  }
+  if (!states.length) states = [null];   // one sphere, no state arrow
+
+  // ensure one assembly per qubit
+  while (assemblies.length < states.length) {
+    const a = makeAssembly();
+    assemblies.push(a);
+    root.add(a);
+  }
+  while (assemblies.length > states.length) root.remove(assemblies.pop());
+
+  // layout: 1 qubit big and centered, several qubits in a scaled row
+  const n = states.length;
+  const s = n === 1 ? 1 : Math.min(0.55, 2.6 / n);
+  const spacing = 3.3 * s;
+  assemblies.forEach((a, i) => {
+    a.scale.setScalar(s);
+    a.position.set((i - (n - 1) / 2) * spacing, 0, 0);
+    const st = states[i];
+    const arrow = a.userData.stateArrow;
+    if (st) {
+      // Bloch (x, y, z) -> three.js (x, z, y): |0>/|1> vertical, |i>/|-i> along three.js Z
+      const bv = blochVector(st);
+      arrow.setDirection(new THREE.Vector3(bv.x, bv.z, bv.y));
+      arrow.visible = true;
+    } else {
+      arrow.visible = false;
+    }
+  });
+}
+textbox.addEventListener('input', () => { autoSize(); update(); });
+addEventListener('resize', autoSize);
+autoSize();
+update();
+
+/* mouse "rolling": drag to rotate the whole scene group */
 let isDragging = false, prevX = 0, prevY = 0;
 renderer.domElement.addEventListener('pointerdown', e => {
   isDragging = true;
@@ -158,7 +411,7 @@ addEventListener('pointermove', e => {
   const q = new THREE.Quaternion()
     .setFromAxisAngle(camUp, dx * speed)
     .multiply(new THREE.Quaternion().setFromAxisAngle(camRight, dy * speed));
-  group.quaternion.premultiply(q);
+  root.quaternion.premultiply(q);
 });
 
 function animate() {
