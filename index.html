@@ -88,19 +88,31 @@ const KETS = {
   '|-i>': { a: C(Math.SQRT1_2), b: C(0, -Math.SQRT1_2) }
 };
 
-// state arithmetic: numbers behave as scalars (b = 0), kets as vectors
+/* values are tagged: scalars ({scalar: true}) vs qubit states a|0> + b|1>.
+   explicit tagging keeps states with b = 0 (e.g. |0>) from looking like scalars */
+const Sc = z => ({ a: z, b: C(0), scalar: true });    // scalar wrapping a complex number
+const St = (a, b) => ({ a, b, scalar: false });       // state a|0> + b|1>
+const isScalar = s => s.scalar === true;
+
+// state arithmetic: scalars scale states; two states cannot be multiplied
 function smul(u, v) {
-  if (isScalar(u)) return { a: cmul(u, v.a), b: cmul(u, v.b) };
-  if (isScalar(v)) return { a: cmul(u.a, v), b: cmul(u.b, v) };
+  if (isScalar(u) && isScalar(v)) return Sc(cmul(u.a, v.a));
+  if (isScalar(u)) return St(cmul(u.a, v.a), cmul(u.a, v.b));
+  if (isScalar(v)) return St(cmul(u.a, v.a), cmul(u.b, v.a));
   throw new Error('cannot multiply two states');
 }
 function sdiv(u, v) {
-  if (isScalar(v)) return { a: cdiv(u.a, v), b: cdiv(u.b, v) };
-  throw new Error('cannot divide by a state');
+  if (!isScalar(v)) throw new Error('cannot divide by a state');
+  return isScalar(u) ? Sc(cdiv(u.a, v.a)) : St(cdiv(u.a, v.a), cdiv(u.b, v.a));
 }
-const isScalar = s => s.b.re === 0 && s.b.im === 0;
-const sadd = (u, v) => ({ a: cadd(u.a, v.a), b: cadd(u.b, v.b) });
-const ssub = (u, v) => ({ a: csub(u.a, v.a), b: csub(u.b, v.b) });
+function sadd(u, v) {
+  if (isScalar(u) !== isScalar(v)) throw new Error('cannot add a scalar and a state');
+  return isScalar(u) ? Sc(cadd(u.a, v.a)) : St(cadd(u.a, v.a), cadd(u.b, v.b));
+}
+function ssub(u, v) {
+  if (isScalar(u) !== isScalar(v)) throw new Error('cannot subtract a scalar and a state');
+  return isScalar(u) ? Sc(csub(u.a, v.a)) : St(csub(u.a, v.a), csub(u.b, v.b));
+}
 
 /* tokenizer: kets are atomic; implicit multiplication supported */
 function tokenize(src) {
@@ -119,7 +131,8 @@ function tokenize(src) {
       continue;
     }
     if (/[0-9.]/.test(ch)) {
-      const m = src.slice(i).match(/^[0-9]*\.?[0-9]+/);
+      const m = src.slice(i).match(/^([0-9]+\.?[0-9]*|\.[0-9]+)/);
+      if (!m) throw new Error(`malformed number at "${src.slice(i, i + 6)}"`);
       tokens.push({ t: 'num', v: parseFloat(m[0]) });
       i += m[0].length;
       continue;
@@ -173,24 +186,23 @@ function parseExpr(tokens) {
     if (peek() && peek().t === '+') { next(); return unary(); }
     return power();
   }
-  function neg(s) { return { a: cscale(s.a, -1), b: cscale(s.b, -1) }; }
+  function neg(s) { return isScalar(s) ? Sc(cscale(s.a, -1)) : St(cscale(s.a, -1), cscale(s.b, -1)); }
   function power() {
     let v = atom();
     if (peek() && peek().t === '^') { next(); v = spow(v, unary()); }
     return v;
   }
   function spow(u, v) {
-    if (isScalar(u) && isScalar(v)) return { a: cpow(u.a, v.a), b: C(0) };
-    if (isScalar(v)) return { a: cpow(u.a, v.a), b: cpow(u.b, v.a) };
-    throw new Error('cannot raise a state to a state power');
+    if (!isScalar(v)) throw new Error('cannot raise to a state power');
+    return isScalar(u) ? Sc(cpow(u.a, v.a)) : St(cpow(u.a, v.a), cpow(u.b, v.a));
   }
   function atom() {
     const p = next();
     if (!p) throw new Error('unexpected end of expression');
-    if (p.t === 'num') return { a: C(p.v), b: C(0) };
-    if (p.t === 'i') return { a: C(0, 1), b: C(0) };
-    if (p.t === 'pi') return { a: C(Math.PI), b: C(0) };
-    if (p.t === 'e') return { a: C(Math.E), b: C(0) };
+    if (p.t === 'num') return Sc(C(p.v));
+    if (p.t === 'i') return Sc(C(0, 1));
+    if (p.t === 'pi') return Sc(C(Math.PI));
+    if (p.t === 'e') return Sc(C(Math.E));
     if (p.t === 'ket') return KETS[p.v];
     if (p.t === '(') { const v = expr(); expect(')'); return v; }
     if (p.t === 'fn') {
@@ -200,14 +212,14 @@ function parseExpr(tokens) {
         expect(')');
         if (!isScalar(v)) throw new Error('sqrt of a state');
         if (v.a.re < 0 || v.a.im !== 0) throw new Error('sqrt of negative');
-        return { a: C(Math.sqrt(v.a.re)), b: C(0) };
+        return Sc(C(Math.sqrt(v.a.re)));
       }
       if (p.v === 'exp') {
         expect('(');
         const v = expr();
         expect(')');
         if (!isScalar(v)) throw new Error('exp of a state');
-        return { a: cpow(C(Math.E), v.a), b: C(0) };
+        return Sc(cpow(C(Math.E), v.a));
       }
     }
     throw new Error(`unexpected token "${p.t}"`);
@@ -218,38 +230,39 @@ function parseExpr(tokens) {
   return v;
 }
 
-/* parse one comma-separated qubit expression -> normalized {a, b} or null */
+/* parse one comma-separated qubit expression -> normalized state */
 function parseQubit(src) {
   const s = parseExpr(tokenize(src));
+  if (isScalar(s)) throw new Error('not a qubit state');
   const mag = Math.hypot(cabs(s.a), cabs(s.b));
   if (mag < 1e-12) throw new Error('zero state');
-  return { a: cscale(s.a, 1 / mag), b: cscale(s.b, 1 / mag) };
+  return St(cscale(s.a, 1 / mag), cscale(s.b, 1 / mag));
 }
 
 // Bloch vector of a|0> + b|1>  (r_x = 2 Re(a* b), r_y = 2 Im(a* b), r_z = |a|^2 - |b|^2)
 function blochVector(state) {
   const ab = cmul(C(state.a.re, -state.a.im), state.b);
   return new THREE.Vector3(
-    2 * ab.re,            // Bloch x
-    state.a.re ** 2 + state.a.im ** 2 - state.b.re ** 2 - state.b.im ** 2,  // Bloch z
-    2 * ab.im             // Bloch y
+    2 * ab.re,            // r_x
+    2 * ab.im,            // r_y
+    state.a.re ** 2 + state.a.im ** 2 - state.b.re ** 2 - state.b.im ** 2  // r_z
   );
 }
 
 /* ================= scene: reusable Bloch sphere assemblies ================= */
 
-const sphereGeo = new THREE.SphereGeometry(1, 48, 48);
-const sphereMat = new THREE.MeshPhongMaterial({
-  color: 0x2255aa, transparent: true, opacity: 0.15,
+const sphereGeo = new THREE.SphereGeometry(1, 48, 36);
+// MeshBasicMaterial: the scene has no lights, so Phong would render black/invisible
+const sphereMat = new THREE.MeshBasicMaterial({
+  color: 0x2255aa, transparent: true, opacity: 0.12,
   side: THREE.DoubleSide, depthWrite: false
 });
-const wireGeo = new THREE.EdgesGeometry(new THREE.SphereGeometry(1, 32, 24));
-const wireMat = new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.25 });
+const wireMat = new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.18 });
 const equatorGeo = new THREE.BufferGeometry().setFromPoints(
   new THREE.EllipseCurve(0, 0, 1, 1, 0, Math.PI * 2).getPoints(128).map(p => new THREE.Vector3(p.x, 0, -p.y))
 );
-const equatorMat = new THREE.LineBasicMaterial({ color: 0xffaa00 });
-const arrowHead = { headLength: 0.08, headWidth: 0.04 };
+const equatorMat = new THREE.LineBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.4 });
+const arrowHead = { headLength: 0.06, headWidth: 0.03 };
 const labelMats = {
   '|0>': makeLabelMat('|0\u27E9', '#ff6666'),  '|1>': makeLabelMat('|1\u27E9', '#ff6666'),
   '|+>': makeLabelMat('|+\u27E9', '#66ff66'),  '|->': makeLabelMat('|\u2212\u27E9', '#66ff66'),
@@ -279,10 +292,38 @@ function makeLabelSprite(key) {
 
 function makeAssembly() {
   const g = new THREE.Group();
+  // Create sparse grid lines (latitude/longitude) manually, full sphere
+  const wireGroup = new THREE.Group();
+  const latitudes = [-60, -30, 30, 60]; // degrees (equator drawn separately)
+  const longitudes = [0, 45, 90, 135]; // degrees (each is a full great circle)
+  for (const lat of latitudes) {
+    const points = [];
+    const theta = (Math.PI / 180) * lat;
+    for (let i = 0; i <= 128; i++) {
+      const phi = (Math.PI * 2 * i) / 128;
+      const x = Math.cos(theta) * Math.sin(phi);
+      const y = Math.sin(theta);
+      const z = -Math.cos(theta) * Math.cos(phi);
+      points.push(new THREE.Vector3(x, y, z));
+    }
+    wireGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), wireMat));
+  }
+  for (const lon of longitudes) {
+    const points = [];
+    const theta = (Math.PI / 180) * lon;
+    for (let i = 0; i <= 128; i++) {
+      const phi = (Math.PI * 2 * i) / 128;
+      const x = Math.cos(phi) * Math.cos(theta);
+      const y = Math.sin(phi);
+      const z = -Math.cos(phi) * Math.sin(theta);
+      points.push(new THREE.Vector3(x, y, z));
+    }
+    wireGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), wireMat));
+  }
   g.add(
-    new THREE.Mesh(sphereGeo, sphereMat),
-    new THREE.LineSegments(wireGeo, wireMat),
+    wireGroup,
     new THREE.Line(equatorGeo, equatorMat),
+    new THREE.Mesh(sphereGeo, sphereMat),
     new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, arrowHead.headLength, arrowHead.headWidth),
     new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, arrowHead.headLength, arrowHead.headWidth),
     new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 1.25, 0xff4444, arrowHead.headLength, arrowHead.headWidth),
@@ -349,7 +390,8 @@ function update() {
       states = splitQubits(src).map(parseQubit);
       textbox.classList.remove('invalid');
     } catch (e) {
-      textbox.classList.add('invalid');   // keep last valid render
+      textbox.classList.add('invalid');
+      return;                           // keep last valid render
     }
   } else {
     textbox.classList.remove('invalid');
@@ -383,8 +425,6 @@ function update() {
     }
   });
 }
-textbox.addEventListener('input', () => { autoSize(); update(); });
-addEventListener('resize', autoSize);
 autoSize();
 update();
 
