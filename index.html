@@ -25,10 +25,20 @@
     z-index: 10;
   }
   #textbox.invalid { box-shadow: inset 0 2px 0 0 #ff4444; }
+  #hint {
+    position: fixed;
+    top: 8px; right: 12px;
+    color: #889;
+    font: 11px monospace;
+    opacity: 0.6;
+    pointer-events: none;
+    z-index: 10;
+  }
 </style>
 </head>
 <body>
 <textarea id="textbox" rows="1" placeholder="e.g. |0>,  1/sqrt(2) |0> + 1/sqrt(2) |1>,  sqrt(3)/2 |0> + 1/2 |1>,  |+>,  e^(i pi/4) |1>  (separate multiple qubits with commas)"></textarea>
+<div id="hint">left drag: rotate &nbsp;·&nbsp; middle / shift+left drag: pan &nbsp;·&nbsp; scroll: zoom</div>
 <script type="importmap">
 {
   "imports": {
@@ -350,7 +360,7 @@ function makeAssembly() {
   return g;
 }
 
-/* rolling parent: all assemblies share one rotating frame */
+/* parent group for all assemblies */
 const root = new THREE.Group();
 scene.add(root);
 
@@ -381,6 +391,10 @@ function autoSize() {
 }
 textbox.addEventListener('input', () => { autoSize(); update(); });
 addEventListener('resize', autoSize);
+
+// camera framing: re-fit the view whenever the row width (qubit count) changes
+let lastLayoutN = -1;
+let frameRadius = 1.7;
 
 function update() {
   const src = textbox.value.trim();
@@ -424,35 +438,88 @@ function update() {
       arrow.visible = false;
     }
   });
-}
-autoSize();
-update();
 
-/* mouse "rolling": drag to rotate the whole scene group */
-let isDragging = false, prevX = 0, prevY = 0;
+  // fit the camera to the row whenever its width changes so spheres never overflow
+  if (n !== lastLayoutN) {
+    lastLayoutN = n;
+    frameRadius = (n - 1) / 2 * spacing + 1.7 * s;
+    frameContent(frameRadius);
+  }
+}
+
+/* ============ navigation: Blender-style camera controls ============
+   left drag: orbit the view · middle (or shift+left) drag: pan · scroll: zoom */
+const view = {
+  target: new THREE.Vector3(0, 0, 0),
+  yaw: Math.atan2(3, 4),      // orientation matches the initial camera position (3, 2, 4)
+  pitch: Math.atan2(2, 5),
+  dist: Math.hypot(3, 2, 4)
+};
+let userNavigated = false;     // manual camera moves disable auto re-fit on resize
+
+function applyView() {
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  camera.position.set(
+    view.target.x + view.dist * cp * Math.sin(view.yaw),
+    view.target.y + view.dist * sp,
+    view.target.z + view.dist * cp * Math.cos(view.yaw)
+  );
+  camera.lookAt(view.target);
+}
+
+// pull the camera back until a sphere of the given radius fits on screen
+function frameContent(radius) {
+  const vFov = THREE.MathUtils.degToRad(camera.fov);
+  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+  view.target.set(0, 0, 0);
+  view.dist = Math.min(60, radius / Math.sin(Math.min(vFov, hFov) / 2) * 1.05);
+  applyView();
+}
+
+let dragMode = '', prevX = 0, prevY = 0;
 renderer.domElement.addEventListener('pointerdown', e => {
-  isDragging = true;
+  if (e.button === 1) dragMode = 'pan';            // middle mouse moves around
+  else if (e.button === 0) dragMode = e.shiftKey ? 'pan' : 'orbit';
+  else return;
   prevX = e.clientX;
   prevY = e.clientY;
+  userNavigated = true;
+  renderer.domElement.setPointerCapture(e.pointerId);
+  e.preventDefault();                              // no middle-click autoscroll
 });
-addEventListener('pointerup', () => { isDragging = false; });
+addEventListener('pointerup', () => { dragMode = ''; });
+addEventListener('pointercancel', () => { dragMode = ''; });
 addEventListener('pointermove', e => {
-  if (!isDragging) return;
+  if (!dragMode) return;
   const dx = e.clientX - prevX;
   const dy = e.clientY - prevY;
   prevX = e.clientX;
   prevY = e.clientY;
 
-  // Trackball roll: rotate around camera-relative axes so drags always
-  // match the hand, no matter how the sphere is currently oriented.
-  const speed = 0.005;
-  const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
-  const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion).normalize();
-  const q = new THREE.Quaternion()
-    .setFromAxisAngle(camUp, dx * speed)
-    .multiply(new THREE.Quaternion().setFromAxisAngle(camRight, dy * speed));
-  root.quaternion.premultiply(q);
+  if (dragMode === 'orbit') {
+    // orbit: the scene follows the cursor
+    view.yaw -= dx * 0.005;
+    view.pitch += dy * 0.005;
+    view.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, view.pitch));
+  } else {
+    // pan: drag the scene with the cursor in the camera's screen plane
+    const k = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * view.dist / innerHeight;
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion).normalize();
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
+    view.target.addScaledVector(right, -dx * k);
+    view.target.addScaledVector(up, dy * k);
+  }
+  applyView();
 });
+renderer.domElement.addEventListener('wheel', e => {
+  e.preventDefault();
+  userNavigated = true;
+  view.dist = Math.min(60, Math.max(0.5, view.dist * Math.exp(e.deltaY * 0.001)));
+  applyView();
+}, { passive: false });
+
+autoSize();
+update();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -464,6 +531,7 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  if (!userNavigated) frameContent(frameRadius);   // auto re-fit until the user takes over
 });
 </script>
 </body>
