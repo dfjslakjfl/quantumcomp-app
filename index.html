@@ -5,9 +5,26 @@
 <style>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
   canvas { display: block; }
+  #textbox {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    box-sizing: border-box;
+    width: 100%;
+    height: 48px;
+    padding: 8px 12px;
+    background: rgba(20, 20, 30, 0.9);
+    color: #eee;
+    border: none;
+    border-top: 1px solid #334;
+    font: 16px sans-serif;
+    outline: none;
+    resize: none;
+    z-index: 10;
+  }
 </style>
 </head>
 <body>
+<textarea id="textbox" placeholder="Ask a question about the qubit…"></textarea>
 <script type="importmap">
 {
   "imports": {
@@ -60,15 +77,12 @@ const equator = new THREE.Line(
 scene.add(equator);
 
 // Bloch axes: |0>/|1> along vertical (three.js Y), |+>/|-> along X, |i>/|-i> along Z
-function axis(dir, color) {
-  return new THREE.ArrowHelper(dir.clone().normalize(), new THREE.Vector3(), 1.25, color, 0.08, 0.04);
-}
-scene.add(axis(new THREE.Vector3(0, 1, 0), 0xff4444));   // |0> (north pole)
-scene.add(axis(new THREE.Vector3(0, -1, 0), 0xff4444));  // |1> (south pole)
-scene.add(axis(new THREE.Vector3(1, 0, 0), 0x44ff44));   // |+>
-scene.add(axis(new THREE.Vector3(-1, 0, 0), 0x44ff44));  // |->
-scene.add(axis(new THREE.Vector3(0, 0, 1), 0x4488ff));   // |i>
-scene.add(axis(new THREE.Vector3(0, 0, -1), 0x4488ff));  // |-i>
+const xAxis = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, 0.08, 0.04);  // |+>
+const xNegAxis = new THREE.ArrowHelper(new THREE.Vector3(-1, 0, 0), new THREE.Vector3(), 1.25, 0x44ff44, 0.08, 0.04);  // |->
+const yAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), 1.25, 0xff4444, 0.08, 0.04);  // |0> (north pole)
+const yNegAxis = new THREE.ArrowHelper(new THREE.Vector3(0, -1, 0), new THREE.Vector3(), 1.25, 0xff4444, 0.08, 0.04);  // |1> (south pole)
+const zAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 1.25, 0x4488ff, 0.08, 0.04);  // |i>
+const zNegAxis = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 1.25, 0x4488ff, 0.08, 0.04);  // |-i>
 
 // Text labels as camera-facing sprites
 function makeLabel(text, color) {
@@ -104,10 +118,6 @@ const labels = [
   return s;
 });
 
-// State vector: some generic state (x, y, z) on the unit sphere
-const stateVec = new THREE.Vector3(0.5, 0.7, 0.3).normalize();
-const stateArrow = new THREE.ArrowHelper(stateVec, new THREE.Vector3(), 1, 0xffffff, 0.12, 0.06);
-scene.add(stateArrow);
 
 // Lights
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
@@ -116,12 +126,15 @@ light.position.set(5, 5, 5);
 scene.add(light);
 
 // Mouse "rolling": drag to rotate the whole scene group
+// Invariant: sphere, grid, equator, all six axis arrows, their labels,
+// and the state vector must share the same rotating parent.
 const group = new THREE.Group();
+group.add(
+  sphere, wire, equator,
+  xAxis, xNegAxis, yAxis, yNegAxis, zAxis, zNegAxis,
+  ...labels
+);
 scene.add(group);
-for (const o of [sphere, wire, equator, stateArrow, ...labels,
-                 ...scene.children.filter(o => o.isArrowHelper && o !== stateArrow)]) {
-  group.add(o);
-}
 
 let isDragging = false, prevX = 0, prevY = 0;
 renderer.domElement.addEventListener('pointerdown', e => {
